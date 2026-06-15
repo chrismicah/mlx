@@ -1,7 +1,6 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import math
-import os
 import unittest
 
 import mlx.core as mx
@@ -170,19 +169,35 @@ class TestFast(mlx_tests.MLXTestCase):
                 x, dims, traditional=traditional, base=base, scale=scale, offset=offset
             )
 
-    @unittest.skipIf("CI" in os.environ, "Allocates too much memory for CI")
-    def test_rope_large_input(self):
+    @unittest.skipIf(not mx.cuda.is_available(), "CUDA is not available")
+    def test_rope_large_uncontiguous_cuda_grid(self):
         dims, seq_len, batch_size, n_heads = 32, 8192, 8, 32
         base, scale, offset, traditional = 10000.0, 1.0, 0, False
-        x = mx.random.normal(shape=[batch_size, seq_len, n_heads, dims]).astype(
-            mx.float32
-        )
+        x = mx.zeros([batch_size, seq_len, n_heads, dims], dtype=mx.float16)
+        samples = [
+            (0, 0, 0, 1.25, -0.75),
+            (7, seq_len - 1, n_heads - 1, -2.0, 0.5),
+        ]
+        for batch, seq, head, x1, x2 in samples:
+            x = x.at[batch, seq, head, 0].set(x1)
+            x = x.at[batch, seq, head, dims // 2].set(x2)
         x = x.swapaxes(1, 2)
         rx_fast = mx.fast.rope(
             x, dims, traditional=traditional, base=base, scale=scale, offset=offset
         )
-        ref = rope_orig(x, dims, traditional, base, scale, offset)
-        self.assertLess(mx.abs(ref - rx_fast).max(), 5e-3)
+        self.assertEqual(rx_fast.shape, x.shape)
+        for batch, seq, head, x1, x2 in samples:
+            theta = (seq + offset) * scale
+            expected_1 = x1 * math.cos(theta) - x2 * math.sin(theta)
+            expected_2 = x1 * math.sin(theta) + x2 * math.cos(theta)
+            self.assertAlmostEqual(
+                rx_fast[batch, head, seq, 0].item(), expected_1, delta=1e-2
+            )
+            self.assertAlmostEqual(
+                rx_fast[batch, head, seq, dims // 2].item(),
+                expected_2,
+                delta=1e-2,
+            )
 
     def test_rope_dims_validation(self):
         T = 4
